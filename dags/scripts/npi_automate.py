@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 from dateutil.relativedelta import relativedelta
 
 from duckdb_provider.hooks.duckdb_hook import DuckDBHook
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
 try:
     from .fileutils import get_logger, log_step, log_file_info, log_dir_contents
@@ -127,9 +126,6 @@ def process_extracted_npi_data_v2():
             con.execute(f"SET {key}={value}")
     logger.info(f"DuckDB configured from Airflow connection 'duckdb_default': {extra}")
 
-    s3_hook = S3Hook(aws_conn_id="aws_s3")
-    s3_bucket = "reference-data-platform"
-
     with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
 
         for file_name in zip_ref.namelist():
@@ -227,16 +223,6 @@ def process_extracted_npi_data_v2():
                         (FORMAT PARQUET, COMPRESSION SNAPPY)
                     """)
                     log_file_info(logger, output_path, label="written parquet")
-
-                    s3_key = os.path.basename(output_path)
-                    with log_step(logger, f"upload {s3_key} -> s3://{s3_bucket}/nppes/{s3_key}"):
-                        s3_hook.load_file(
-                            filename=output_path,
-                            key="nppes/"+s3_key,
-                            bucket_name=s3_bucket,
-                            replace=True,
-                        )
-                    logger.info(f"Uploaded parquet to s3://{s3_bucket}/{s3_key}")
 
                     if previous_parquet and os.path.exists(previous_parquet):
                         os.remove(previous_parquet)
