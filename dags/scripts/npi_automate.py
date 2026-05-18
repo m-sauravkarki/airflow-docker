@@ -23,23 +23,39 @@ logger = get_logger("nppes.npi_automate")
 parquet_output_dir = 'parquet_output_dir/nppes/'
 
 def dynamic_base_url():
-    # Get current date
+    """Resolve CMS NPPES dump URL.
+
+    Try current month first; if it returns 404 (not yet published), fall back
+    to the previous month. relativedelta handles year rollover (Jan -> Dec prev year).
+    """
     today = datetime.now()
 
-    # Subtract exactly one month to handle year rollovers automatically
-    last_month_date = today - relativedelta(months=1)
+    def build_url(dt):
+        return (
+            f"https://download.cms.gov/nppes/"
+            f"NPPES_Data_Dissemination_{dt.strftime('%B')}_{dt.year}_V2.zip"
+        )
 
-    # Extract the name and year
-    month_name = last_month_date.strftime("%B")
-    year = last_month_date.year
+    current_url = build_url(today)
+    logger.info(f"Probing current-month CMS NPPES URL: {current_url}")
+    response = requests.head(current_url, allow_redirects=True, timeout=30)
 
-    # Dynamic base url
-    # base_url = f"https://download.cms.gov/nppes/NPPES_Data_Dissemination_{month_name}_{year}_V2.zip"
-    # base_url = "https://download.cms.gov/nppes/NPPES_Data_Dissemination_April_2026_V2.zip"
-    base_url = "https://download.cms.gov/nppes/NPPES_Data_Dissemination_May_2026_V2.zip"
-    logger.info(f"Resolved CMS NPPES URL for {month_name} {year}: {base_url}")
+    if response.status_code == 200:
+        logger.info(f"Current-month dump is published: {current_url}")
+        return current_url
 
-    return base_url
+    if response.status_code == 404:
+        last_month_date = today - relativedelta(months=1)
+        fallback_url = build_url(last_month_date)
+        logger.info(
+            f"Current-month dump not published (404). "
+            f"Falling back to previous month: {fallback_url}"
+        )
+        return fallback_url
+
+    raise requests.exceptions.HTTPError(
+        f"Unexpected status {response.status_code} probing {current_url}"
+    )
 
 
 def request_url():
