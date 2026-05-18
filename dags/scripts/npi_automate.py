@@ -188,34 +188,57 @@ def process_extracted_npi_data_v2():
                         logger.info("No previous parquet found - all rows will be flagged 'A'.")
 
                     if previous_parquet:
-                        select_sql = f"""
-                            SELECT
-                                new.*,
-                                CASE
-                                    WHEN old."NPI" IS NULL THEN 'A'
-                                    WHEN new."Provider First Name" IS DISTINCT FROM old."Provider First Name"
-                                      OR new."Provider Last Name (Legal Name)" IS DISTINCT FROM old."Provider Last Name (Legal Name)"
-                                      OR new."Provider Middle Name" IS DISTINCT FROM old."Provider Middle Name"
-                                      OR new."Provider Name Prefix Text" IS DISTINCT FROM old."Provider Name Prefix Text"
-                                    THEN 'U'
-                                    ELSE 'A'
-                                END AS npi_updated_flag
-                            FROM read_csv(
+                        # Discover every NPPES column from the new CSV header so the
+                        # hash automatically tracks all ~330 fields without hardcoding.
+                        cols_rows = con.execute(f"""
+                            DESCRIBE SELECT * FROM read_csv(
                                 '{extracted_path}',
                                 delim=',',
                                 header=true,
                                 all_varchar=true
-                            ) AS new
-                            LEFT JOIN (
-                                SELECT "NPI",
-                                       "Provider First Name",
-                                       "Provider Last Name (Legal Name)",
-                                       "Provider Middle Name",
-                                       "Provider Name Prefix Text"
-                                       
+                            )
+                        """).fetchall()
+
+                        hash_columns = [r[0] for r in cols_rows if r[0] != "NPI"]
+
+                        # COALESCE(..., '') treats NULL and empty string as the same (both mean "no value" in NPPES); CONCAT_WS preserves column
+                        # position so identical values in different columns don't collide.
+                        hash_concat = ", ".join(
+                            f'COALESCE("{c}", \'\')' for c in hash_columns
+                        )
+                        row_hash_expr = f"md5(CONCAT_WS('|', {hash_concat}))"
+                        logger.info(
+                            f"Row-hash diff over {len(hash_columns)} non-key NPPES columns"
+                        )
+
+                        select_sql = f"""
+                            WITH old_h AS (
+                                SELECT
+                                    "NPI",
+                                    {row_hash_expr} AS row_hash
                                 FROM read_parquet('{previous_parquet}')
-                            ) AS old
-                                ON new."NPI" = old."NPI"
+                            ),
+                            new_h AS (
+                                SELECT
+                                    *,
+                                    {row_hash_expr} AS row_hash
+                                FROM read_csv(
+                                    '{extracted_path}',
+                                    delim=',',
+                                    header=true,
+                                    all_varchar=true
+                                )
+                            )
+                            SELECT
+                                new_h.* EXCLUDE (row_hash),
+                                CASE
+                                    WHEN old_h."NPI" IS NULL THEN 'A'
+                                    WHEN new_h.row_hash IS DISTINCT FROM old_h.row_hash THEN 'U'
+                                    ELSE 'A'
+                                END AS npi_updated_flag
+                            FROM new_h
+                            LEFT JOIN old_h
+                                ON new_h."NPI" = old_h."NPI"
                         """
                     else:
                         select_sql = f"""
