@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 from dateutil.relativedelta import relativedelta
 
 from duckdb_provider.hooks.duckdb_hook import DuckDBHook
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
 try:
     from .fileutils import get_logger, log_step, log_file_info, log_dir_contents
@@ -24,23 +23,39 @@ logger = get_logger("nppes.npi_automate")
 parquet_output_dir = 'parquet_output_dir/nppes/'
 
 def dynamic_base_url():
-    # Get current date
+    """Resolve CMS NPPES dump URL.
+
+    Try current month first; if it returns 404 (not yet published), fall back
+    to the previous month. relativedelta handles year rollover (Jan -> Dec prev year).
+    """
     today = datetime.now()
 
-    # Subtract exactly one month to handle year rollovers automatically
-    last_month_date = today - relativedelta(months=1)
+    def build_url(dt):
+        return (
+            f"https://download.cms.gov/nppes/"
+            f"NPPES_Data_Dissemination_{dt.strftime('%B')}_{dt.year}_V2.zip"
+        )
 
-    # Extract the name and year
-    month_name = last_month_date.strftime("%B")
-    year = last_month_date.year
+    current_url = build_url(today)
+    logger.info(f"Probing current-month CMS NPPES URL: {current_url}")
+    response = requests.head(current_url, allow_redirects=True, timeout=30)
 
-    # Dynamic base url
-    # base_url = f"https://download.cms.gov/nppes/NPPES_Data_Dissemination_{month_name}_{year}_V2.zip"
-    # base_url = "https://download.cms.gov/nppes/NPPES_Data_Dissemination_April_2026_V2.zip"
-    base_url = "https://download.cms.gov/nppes/NPPES_Data_Dissemination_May_2026_V2.zip"
-    logger.info(f"Resolved CMS NPPES URL for {month_name} {year}: {base_url}")
+    if response.status_code == 200:
+        logger.info(f"Current-month dump is published: {current_url}")
+        return current_url
 
-    return base_url
+    if response.status_code == 404:
+        last_month_date = today - relativedelta(months=1)
+        fallback_url = build_url(last_month_date)
+        logger.info(
+            f"Current-month dump not published (404). "
+            f"Falling back to previous month: {fallback_url}"
+        )
+        return fallback_url
+
+    raise requests.exceptions.HTTPError(
+        f"Unexpected status {response.status_code} probing {current_url}"
+    )
 
 
 def request_url():
@@ -127,9 +142,6 @@ def process_extracted_npi_data_v2():
             con.execute(f"SET {key}={value}")
     logger.info(f"DuckDB configured from Airflow connection 'duckdb_default': {extra}")
 
-    s3_hook = S3Hook(aws_conn_id="aws_s3")
-    s3_bucket = "reference-data-platform"
-
     with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
 
         for file_name in zip_ref.namelist():
@@ -176,34 +188,57 @@ def process_extracted_npi_data_v2():
                         logger.info("No previous parquet found - all rows will be flagged 'A'.")
 
                     if previous_parquet:
-                        select_sql = f"""
-                            SELECT
-                                new.*,
-                                CASE
-                                    WHEN old."NPI" IS NULL THEN 'A'
-                                    WHEN new."Provider First Name" IS DISTINCT FROM old."Provider First Name"
-                                      OR new."Provider Last Name (Legal Name)" IS DISTINCT FROM old."Provider Last Name (Legal Name)"
-                                      OR new."Provider Middle Name" IS DISTINCT FROM old."Provider Middle Name"
-                                      OR new."Provider Name Prefix Text" IS DISTINCT FROM old."Provider Name Prefix Text"
-                                    THEN 'U'
-                                    ELSE 'A'
-                                END AS npi_updated_flag
-                            FROM read_csv(
+                        # Discover every NPPES column from the new CSV header so the
+                        # hash automatically tracks all ~330 fields without hardcoding.
+                        cols_rows = con.execute(f"""
+                            DESCRIBE SELECT * FROM read_csv(
                                 '{extracted_path}',
                                 delim=',',
                                 header=true,
                                 all_varchar=true
-                            ) AS new
-                            LEFT JOIN (
-                                SELECT "NPI",
-                                       "Provider First Name",
-                                       "Provider Last Name (Legal Name)",
-                                       "Provider Middle Name",
-                                       "Provider Name Prefix Text"
-                                       
+                            )
+                        """).fetchall()
+
+                        hash_columns = [r[0] for r in cols_rows if r[0] != "NPI"]
+
+                        # COALESCE(..., '') treats NULL and empty string as the same (both mean "no value" in NPPES); CONCAT_WS preserves column
+                        # position so identical values in different columns don't collide.
+                        hash_concat = ", ".join(
+                            f'COALESCE("{c}", \'\')' for c in hash_columns
+                        )
+                        row_hash_expr = f"md5(CONCAT_WS('|', {hash_concat}))"
+                        logger.info(
+                            f"Row-hash diff over {len(hash_columns)} non-key NPPES columns"
+                        )
+
+                        select_sql = f"""
+                            WITH old_h AS (
+                                SELECT
+                                    "NPI",
+                                    {row_hash_expr} AS row_hash
                                 FROM read_parquet('{previous_parquet}')
-                            ) AS old
-                                ON new."NPI" = old."NPI"
+                            ),
+                            new_h AS (
+                                SELECT
+                                    *,
+                                    {row_hash_expr} AS row_hash
+                                FROM read_csv(
+                                    '{extracted_path}',
+                                    delim=',',
+                                    header=true,
+                                    all_varchar=true
+                                )
+                            )
+                            SELECT
+                                new_h.* EXCLUDE (row_hash),
+                                CASE
+                                    WHEN old_h."NPI" IS NULL THEN 'A'
+                                    WHEN new_h.row_hash IS DISTINCT FROM old_h.row_hash THEN 'U'
+                                    ELSE 'A'
+                                END AS npi_updated_flag
+                            FROM new_h
+                            LEFT JOIN old_h
+                                ON new_h."NPI" = old_h."NPI"
                         """
                     else:
                         select_sql = f"""
@@ -227,16 +262,6 @@ def process_extracted_npi_data_v2():
                         (FORMAT PARQUET, COMPRESSION SNAPPY)
                     """)
                     log_file_info(logger, output_path, label="written parquet")
-
-                    s3_key = os.path.basename(output_path)
-                    with log_step(logger, f"upload {s3_key} -> s3://{s3_bucket}/nppes/{s3_key}"):
-                        s3_hook.load_file(
-                            filename=output_path,
-                            key="nppes/"+s3_key,
-                            bucket_name=s3_bucket,
-                            replace=True,
-                        )
-                    logger.info(f"Uploaded parquet to s3://{s3_bucket}/{s3_key}")
 
                     if previous_parquet and os.path.exists(previous_parquet):
                         os.remove(previous_parquet)
