@@ -16,6 +16,9 @@ S3_BUCKET = "reference-data-platform"
 S3_PREFIX = "nppes"
 AWS_CONN_ID = "aws_s3"
 MANIFEST_FILENAME = "_manifest.json"
+# Local parquet keeps the dated NPPES filename (used for prev-vs-new diff);
+# in S3 we publish under a stable name so consumers don't chase month-stamps.
+S3_PARQUET_FILENAME = "nppes_npi.parquet"
 
 # Default arguments
 default_args = {
@@ -49,14 +52,19 @@ def upload_file_in_s3(file_path, s3_key, bucket_name=S3_BUCKET, aws_conn_id=AWS_
 
 
 def upload_parquet_to_s3():
-    parquet_files = [f for f in os.listdir(PARQUET_DIR) if f.endswith('.parquet')]
+    parquet_files = [
+        os.path.join(PARQUET_DIR, f)
+        for f in os.listdir(PARQUET_DIR)
+        if f.endswith('.parquet')
+    ]
     if not parquet_files:
         raise FileNotFoundError(f"No parquet file found in {PARQUET_DIR}")
-    for entry in parquet_files:
-        upload_file_in_s3(
-            file_path=os.path.join(PARQUET_DIR, entry),
-            s3_key=f"{S3_PREFIX}/{entry}",
-        )
+    # Defensive: if cleanup ever leaves more than one, pick the freshest.
+    latest_parquet = max(parquet_files, key=os.path.getmtime)
+    upload_file_in_s3(
+        file_path=latest_parquet,
+        s3_key=f"{S3_PREFIX}/{S3_PARQUET_FILENAME}",
+    )
 
 
 def upload_manifest_to_s3():
